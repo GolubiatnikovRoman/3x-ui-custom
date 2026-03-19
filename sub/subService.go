@@ -906,22 +906,22 @@ func (s *SubService) genRemark(inbound *model.Inbound, email string, extra strin
 	var remark []string
 
 	for i := 0; i < len(orderChars); i++ {
-			char := orderChars[i]
-			order, exists := orders[char]
-			if !exists || order == "" {
-					continue
-			}
+		char := orderChars[i]
+		order, exists := orders[char]
+		if !exists || order == "" {
+			continue
+		}
 
-			if char == 'e' {
-					if len(remark) == 0 {
-							remark = append(remark, fmt.Sprintf("(%s)", order))
-					} else {
-							remark[len(remark)-1] = fmt.Sprintf("%s (%s)", remark[len(remark)-1], order)
-					}
-					continue
+		if char == 'e' {
+			if len(remark) == 0 {
+				remark = append(remark, fmt.Sprintf("(%s)", order))
+			} else {
+				remark[len(remark)-1] = fmt.Sprintf("%s (%s)", remark[len(remark)-1], order)
 			}
+			continue
+		}
 
-			remark = append(remark, order)
+		remark = append(remark, order)
 	}
 
 	if s.showInfo {
