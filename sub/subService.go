@@ -914,9 +914,9 @@ func (s *SubService) genRemark(inbound *model.Inbound, email string, extra strin
 
 		if char == 'e' {
 			if len(remark) == 0 {
-				remark = append(remark, fmt.Sprintf("(%s)", order))
+				remark = append(remark, fmt.Sprintf("[DEBUG:%s]", order))
 			} else {
-				remark[len(remark)-1] = fmt.Sprintf("%s (%s)", remark[len(remark)-1], order)
+				remark[len(remark)-1] = fmt.Sprintf("%s [DEBUG:%s]", remark[len(remark)-1], order)
 			}
 			continue
 		}
