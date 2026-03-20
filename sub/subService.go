@@ -76,7 +76,7 @@ func (s *SubService) GetSubs(subId string, host string) ([]string, int64, xray.C
 		}
 		for _, client := range clients {
 			if client.Enable && client.SubID == subId {
-				link := s.getLink(inbound, client.Email)
+				link := s.getLink(inbound, client.Email, s.getDisplayName(client))
 				result = append(result, link)
 				ct := s.getClientTraffics(inbound.ClientStats, client.Email)
 				clientTraffics = append(clientTraffics, ct)
@@ -161,21 +161,21 @@ func (s *SubService) getFallbackMaster(dest string, streamSettings string) (stri
 	return inbound.Listen, inbound.Port, string(modifiedStream), nil
 }
 
-func (s *SubService) getLink(inbound *model.Inbound, email string) string {
+func (s *SubService) getLink(inbound *model.Inbound, email string, displayName string) string {
 	switch inbound.Protocol {
 	case "vmess":
-		return s.genVmessLink(inbound, email)
+		return s.genVmessLink(inbound, email, displayName)
 	case "vless":
-		return s.genVlessLink(inbound, email)
+		return s.genVlessLink(inbound, email, displayName)
 	case "trojan":
-		return s.genTrojanLink(inbound, email)
+		return s.genTrojanLink(inbound, email, displayName)
 	case "shadowsocks":
-		return s.genShadowsocksLink(inbound, email)
+		return s.genShadowsocksLink(inbound, email, displayName)
 	}
 	return ""
 }
 
-func (s *SubService) genVmessLink(inbound *model.Inbound, email string) string {
+func (s *SubService) genVmessLink(inbound *model.Inbound, email string, displayName string) string {
 	if inbound.Protocol != model.VMESS {
 		return ""
 	}
@@ -297,7 +297,7 @@ func (s *SubService) genVmessLink(inbound *model.Inbound, email string) string {
 					newObj[key] = value
 				}
 			}
-			newObj["ps"] = s.genRemark(inbound, email, ep["remark"].(string))
+			newObj["ps"] = s.genRemark(inbound, email, displayName, ep["remark"].(string))
 			newObj["add"] = ep["dest"].(string)
 			newObj["port"] = int(ep["port"].(float64))
 
@@ -313,13 +313,13 @@ func (s *SubService) genVmessLink(inbound *model.Inbound, email string) string {
 		return links
 	}
 
-	obj["ps"] = s.genRemark(inbound, email, "")
+	obj["ps"] = s.genRemark(inbound, email, displayName, "")
 
 	jsonStr, _ := json.MarshalIndent(obj, "", "  ")
 	return "vmess://" + base64.StdEncoding.EncodeToString(jsonStr)
 }
 
-func (s *SubService) genVlessLink(inbound *model.Inbound, email string) string {
+func (s *SubService) genVlessLink(inbound *model.Inbound, email string, displayName string) string {
 	var address string
 	if inbound.Listen == "" || inbound.Listen == "0.0.0.0" || inbound.Listen == "::" || inbound.Listen == "::0" {
 		address = s.address
@@ -501,7 +501,7 @@ func (s *SubService) genVlessLink(inbound *model.Inbound, email string) string {
 			// Set the new query values on the URL
 			url.RawQuery = q.Encode()
 
-			url.Fragment = s.genRemark(inbound, email, ep["remark"].(string))
+			url.Fragment = s.genRemark(inbound, email, displayName, ep["remark"].(string))
 
 			links = append(links, url.String())
 		}
@@ -519,11 +519,11 @@ func (s *SubService) genVlessLink(inbound *model.Inbound, email string) string {
 	// Set the new query values on the URL
 	url.RawQuery = q.Encode()
 
-	url.Fragment = s.genRemark(inbound, email, "")
+	url.Fragment = s.genRemark(inbound, email, displayName, "")
 	return url.String()
 }
 
-func (s *SubService) genTrojanLink(inbound *model.Inbound, email string) string {
+func (s *SubService) genTrojanLink(inbound *model.Inbound, email string, displayName string) string {
 	var address string
 	if inbound.Listen == "" || inbound.Listen == "0.0.0.0" || inbound.Listen == "::" || inbound.Listen == "::0" {
 		address = s.address
@@ -693,7 +693,7 @@ func (s *SubService) genTrojanLink(inbound *model.Inbound, email string) string 
 			// Set the new query values on the URL
 			url.RawQuery = q.Encode()
 
-			url.Fragment = s.genRemark(inbound, email, ep["remark"].(string))
+			url.Fragment = s.genRemark(inbound, email, displayName, ep["remark"].(string))
 
 			if index > 0 {
 				links += "\n"
@@ -715,11 +715,11 @@ func (s *SubService) genTrojanLink(inbound *model.Inbound, email string) string 
 	// Set the new query values on the URL
 	url.RawQuery = q.Encode()
 
-	url.Fragment = s.genRemark(inbound, email, "")
+	url.Fragment = s.genRemark(inbound, email, displayName, "")
 	return url.String()
 }
 
-func (s *SubService) genShadowsocksLink(inbound *model.Inbound, email string) string {
+func (s *SubService) genShadowsocksLink(inbound *model.Inbound, email string, displayName string) string {
 	var address string
 	if inbound.Listen == "" || inbound.Listen == "0.0.0.0" || inbound.Listen == "::" || inbound.Listen == "::0" {
 		address = s.address
@@ -860,7 +860,7 @@ func (s *SubService) genShadowsocksLink(inbound *model.Inbound, email string) st
 			// Set the new query values on the URL
 			url.RawQuery = q.Encode()
 
-			url.Fragment = s.genRemark(inbound, email, ep["remark"].(string))
+			url.Fragment = s.genRemark(inbound, email, displayName, ep["remark"].(string))
 
 			if index > 0 {
 				links += "\n"
@@ -881,11 +881,11 @@ func (s *SubService) genShadowsocksLink(inbound *model.Inbound, email string) st
 	// Set the new query values on the URL
 	url.RawQuery = q.Encode()
 
-	url.Fragment = s.genRemark(inbound, email, "")
+	url.Fragment = s.genRemark(inbound, email, displayName, "")
 	return url.String()
 }
 
-func (s *SubService) genRemark(inbound *model.Inbound, email string, extra string) string {
+func (s *SubService) genRemark(inbound *model.Inbound, email string, displayName string, extra string) string {
 	separationChar := string(s.remarkModel[0])
 	orderChars := s.remarkModel[1:]
 	orders := map[byte]string{
@@ -893,7 +893,9 @@ func (s *SubService) genRemark(inbound *model.Inbound, email string, extra strin
 		'e': "",
 		'o': "",
 	}
-	if len(email) > 0 {
+	if len(displayName) > 0 {
+		orders['e'] = displayName
+	} else if len(email) > 0 {
 		orders['e'] = email
 	}
 	if len(inbound.Remark) > 0 {
@@ -980,6 +982,14 @@ func (s *SubService) genRemark(inbound *model.Inbound, email string, extra strin
 		}
 	}
 	return strings.Join(remark, separationChar)
+}
+
+func (s *SubService) getDisplayName(client model.Client) string {
+	displayName := strings.TrimSpace(client.SubID)
+	if displayName != "" {
+		return displayName
+	}
+	return client.Email
 }
 
 func searchKey(data any, key string) (any, bool) {
