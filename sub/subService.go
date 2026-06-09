@@ -1446,9 +1446,11 @@ func (s *SubService) genRemark(inbound *model.Inbound, email string, extra strin
 		'i': "",
 		'e': "",
 		'o': "",
+		'p': "",
 	}
 	if len(email) > 0 && s.emailInRemark {
 		orders['e'] = email
+		orders['p'] = "(" + email + ")"
 	}
 	if len(inbound.Remark) > 0 {
 		orders['i'] = inbound.Remark
