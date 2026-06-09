@@ -6,19 +6,22 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/mhsanaei/3x-ui/v2/database"
-	"github.com/mhsanaei/3x-ui/v2/database/model"
-	"github.com/mhsanaei/3x-ui/v2/logger"
-	"github.com/mhsanaei/3x-ui/v2/util/common"
-	"github.com/mhsanaei/3x-ui/v2/util/random"
-	"github.com/mhsanaei/3x-ui/v2/util/reflect_util"
-	"github.com/mhsanaei/3x-ui/v2/web/entity"
-	"github.com/mhsanaei/3x-ui/v2/xray"
+	"github.com/google/uuid"
+	"github.com/mhsanaei/3x-ui/v3/database"
+	"github.com/mhsanaei/3x-ui/v3/database/model"
+	"github.com/mhsanaei/3x-ui/v3/logger"
+	"github.com/mhsanaei/3x-ui/v3/util/common"
+	"github.com/mhsanaei/3x-ui/v3/util/netproxy"
+	"github.com/mhsanaei/3x-ui/v3/util/random"
+	"github.com/mhsanaei/3x-ui/v3/util/reflect_util"
+	"github.com/mhsanaei/3x-ui/v3/web/entity"
+	"github.com/mhsanaei/3x-ui/v3/xray"
 )
 
 //go:embed config.json
@@ -32,8 +35,11 @@ var defaultValueMap = map[string]string{
 	"webCertFile":                 "",
 	"webKeyFile":                  "",
 	"secret":                      random.Seq(32),
+	"panelGuid":                   uuid.NewString(),
+	"apiToken":                    "",
 	"webBasePath":                 "/",
 	"sessionMaxAge":               "360",
+	"trustedProxyCIDRs":           "127.0.0.1/32,::1/128",
 	"pageSize":                    "25",
 	"expireDiff":                  "0",
 	"trafficDiff":                 "0",
@@ -57,7 +63,7 @@ var defaultValueMap = map[string]string{
 	"subSupportUrl":               "",
 	"subProfileUrl":               "",
 	"subAnnounce":                 "",
-	"subEnableRouting":            "true",
+	"subEnableRouting":            "false",
 	"subRoutingRules":             "",
 	"subListen":                   "",
 	"subPort":                     "2096",
@@ -68,18 +74,28 @@ var defaultValueMap = map[string]string{
 	"subUpdates":                  "12",
 	"subEncrypt":                  "true",
 	"subShowInfo":                 "true",
+	"subEmailInRemark":            "true",
 	"subURI":                      "",
 	"subJsonPath":                 "/json/",
 	"subJsonURI":                  "",
-	"subJsonFragment":             "",
-	"subJsonNoises":               "",
+	"subClashEnable":              "false",
+	"subClashPath":                "/clash/",
+	"subClashURI":                 "",
+	"subClashEnableRouting":       "false",
+	"subClashRules":               "",
 	"subJsonMux":                  "",
 	"subJsonRules":                "",
+	"subJsonFinalMask":            "",
+	"subThemeDir":                 "",
 	"datepicker":                  "gregorian",
 	"warp":                        "",
+	"warpUpdateInterval":          "0",
+	"nord":                        "",
 	"externalTrafficInformEnable": "false",
 	"externalTrafficInformURI":    "",
+	"restartXrayOnClientDisable":  "true",
 	"xrayOutboundTestUrl":         "https://www.google.com/generate_204",
+	"panelProxy":                  "",
 
 	// LDAP defaults
 	"ldapEnable":            "false",
@@ -155,7 +171,7 @@ func (s *SettingService) GetAllSetting() (*entity.AllSetting, error) {
 		fieldV := v.FieldByName(field.Name)
 		switch t := fieldV.Interface().(type) {
 		case int:
-			n, err := strconv.ParseInt(value, 10, 64)
+			n, err := strconv.ParseInt(effectiveSettingValue(key, value), 10, 64)
 			if err != nil {
 				return err
 			}
@@ -163,7 +179,7 @@ func (s *SettingService) GetAllSetting() (*entity.AllSetting, error) {
 		case string:
 			fieldV.SetString(value)
 		case bool:
-			fieldV.SetBool(value == "true")
+			fieldV.SetBool(effectiveSettingValue(key, value) == "true")
 		default:
 			return common.NewErrorf("unknown field %v type %v", key, t)
 		}
@@ -190,6 +206,35 @@ func (s *SettingService) GetAllSetting() (*entity.AllSetting, error) {
 	}
 
 	return allSetting, nil
+}
+
+func (s *SettingService) GetAllSettingView() (*entity.AllSettingView, error) {
+	allSetting, err := s.GetAllSetting()
+	if err != nil {
+		return nil, err
+	}
+	view := &entity.AllSettingView{AllSetting: *allSetting}
+	view.HasTgBotToken = secretConfigured(allSetting.TgBotToken)
+	view.HasTwoFactorToken = secretConfigured(allSetting.TwoFactorToken)
+	view.HasLdapPassword = secretConfigured(allSetting.LdapPassword)
+	view.HasWarpSecret = secretConfigured(mustString(s.GetWarp()))
+	view.HasNordSecret = secretConfigured(mustString(s.GetNord()))
+	var apiTokenCount int64
+	if err := database.GetDB().Model(model.ApiToken{}).Where("enabled = ?", true).Count(&apiTokenCount).Error; err == nil {
+		view.HasApiToken = apiTokenCount > 0
+	}
+	view.TgBotToken = ""
+	view.TwoFactorToken = ""
+	view.LdapPassword = ""
+	return view, nil
+}
+
+func secretConfigured(value string) bool {
+	return strings.TrimSpace(value) != ""
+}
+
+func mustString(value string, _ error) string {
+	return value
 }
 
 func (s *SettingService) ResetSettings() error {
@@ -246,12 +291,21 @@ func (s *SettingService) setString(key string, value string) error {
 	return s.saveSetting(key, value)
 }
 
+func effectiveSettingValue(key, stored string) string {
+	if stored == "" {
+		if def, ok := defaultValueMap[key]; ok {
+			return def
+		}
+	}
+	return stored
+}
+
 func (s *SettingService) getBool(key string) (bool, error) {
 	str, err := s.getString(key)
 	if err != nil {
 		return false, err
 	}
-	return strconv.ParseBool(str)
+	return strconv.ParseBool(effectiveSettingValue(key, str))
 }
 
 func (s *SettingService) setBool(key string, value bool) error {
@@ -263,11 +317,27 @@ func (s *SettingService) getInt(key string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return strconv.Atoi(str)
+	return strconv.Atoi(effectiveSettingValue(key, str))
 }
 
 func (s *SettingService) setInt(key string, value int) error {
 	return s.setString(key, strconv.Itoa(value))
+}
+
+func (s *SettingService) GetWarpLastUpdate() (int64, error) {
+	val, err := s.getString("warpLastUpdate")
+	if err != nil || val == "" {
+		return 0, err
+	}
+	return strconv.ParseInt(val, 10, 64)
+}
+
+func (s *SettingService) SetWarpLastUpdate(val int64) error {
+	return s.saveSetting("warpLastUpdate", strconv.FormatInt(val, 10))
+}
+
+func (s *SettingService) SetWarpUpdateInterval(val int) error {
+	return s.setInt("warpUpdateInterval", val)
 }
 
 func (s *SettingService) GetXrayConfigTemplate() (string, error) {
@@ -279,7 +349,11 @@ func (s *SettingService) GetXrayOutboundTestUrl() (string, error) {
 }
 
 func (s *SettingService) SetXrayOutboundTestUrl(url string) error {
-	return s.setString("xrayOutboundTestUrl", url)
+	clean, err := SanitizeHTTPURL(url)
+	if err != nil {
+		return err
+	}
+	return s.setString("xrayOutboundTestUrl", clean)
 }
 
 func (s *SettingService) GetListen() (string, error) {
@@ -308,6 +382,31 @@ func (s *SettingService) GetTgBotProxy() (string, error) {
 
 func (s *SettingService) SetTgBotProxy(token string) error {
 	return s.setString("tgBotProxy", token)
+}
+
+func (s *SettingService) GetPanelProxy() (string, error) {
+	return s.getString("panelProxy")
+}
+
+func (s *SettingService) SetPanelProxy(proxyUrl string) error {
+	return s.setString("panelProxy", proxyUrl)
+}
+
+// NewProxiedHTTPClient returns an HTTP client that routes the panel's own
+// outbound requests through the configured panelProxy setting. An invalid or
+// missing proxy falls back to a direct client so existing behavior is preserved.
+func (s *SettingService) NewProxiedHTTPClient(timeout time.Duration) *http.Client {
+	proxyUrl, err := s.GetPanelProxy()
+	if err != nil {
+		logger.Warning("Failed to read panel proxy setting:", err)
+		proxyUrl = ""
+	}
+	client, err := netproxy.NewHTTPClient(proxyUrl, timeout)
+	if err != nil {
+		logger.Warningf("Invalid panel proxy %q, using direct connection: %v", proxyUrl, err)
+		return &http.Client{Timeout: timeout}
+	}
+	return client
 }
 
 func (s *SettingService) GetTgBotAPIServer() (string, error) {
@@ -410,6 +509,10 @@ func (s *SettingService) GetSessionMaxAge() (int, error) {
 	return s.getInt("sessionMaxAge")
 }
 
+func (s *SettingService) GetTrustedProxyCIDRs() (string, error) {
+	return s.getString("trustedProxyCIDRs")
+}
+
 func (s *SettingService) GetRemarkModel() (string, error) {
 	return s.getString("remarkModel")
 }
@@ -423,6 +526,24 @@ func (s *SettingService) GetSecret() ([]byte, error) {
 		}
 	}
 	return []byte(secret), err
+}
+
+// GetPanelGuid returns this panel's stable self-identifier, persisting a
+// freshly generated UUID on first read. It is the globally stable node
+// identity used to attribute online clients and inbounds to the physical
+// node that hosts them across a chain of nodes (#4983), where per-panel
+// autoincrement node ids are meaningless one hop away.
+func (s *SettingService) GetPanelGuid() (string, error) {
+	guid, err := s.getString("panelGuid")
+	if err != nil {
+		return "", err
+	}
+	if guid == defaultValueMap["panelGuid"] {
+		if saveErr := s.saveSetting("panelGuid", guid); saveErr != nil {
+			logger.Warning("save panelGuid failed:", saveErr)
+		}
+	}
+	return guid, nil
 }
 
 func (s *SettingService) SetBasePath(basePath string) error {
@@ -458,7 +579,12 @@ func (s *SettingService) GetTimeLocation() (*time.Location, error) {
 	if err != nil {
 		defaultLocation := defaultValueMap["timeLocation"]
 		logger.Errorf("location <%v> not exist, using default location: %v", l, defaultLocation)
-		return time.LoadLocation(defaultLocation)
+		location, err = time.LoadLocation(defaultLocation)
+		if err != nil {
+			logger.Errorf("failed to load default location, using UTC: %v", err)
+			return time.UTC, nil
+		}
+		return location, nil
 	}
 	return location, nil
 }
@@ -543,6 +669,10 @@ func (s *SettingService) GetSubShowInfo() (bool, error) {
 	return s.getBool("subShowInfo")
 }
 
+func (s *SettingService) GetSubEmailInRemark() (bool, error) {
+	return s.getBool("subEmailInRemark")
+}
+
 func (s *SettingService) GetPageSize() (int, error) {
 	return s.getInt("pageSize")
 }
@@ -555,12 +685,24 @@ func (s *SettingService) GetSubJsonURI() (string, error) {
 	return s.getString("subJsonURI")
 }
 
-func (s *SettingService) GetSubJsonFragment() (string, error) {
-	return s.getString("subJsonFragment")
+func (s *SettingService) GetSubClashEnable() (bool, error) {
+	return s.getBool("subClashEnable")
 }
 
-func (s *SettingService) GetSubJsonNoises() (string, error) {
-	return s.getString("subJsonNoises")
+func (s *SettingService) GetSubClashPath() (string, error) {
+	return s.getString("subClashPath")
+}
+
+func (s *SettingService) GetSubClashURI() (string, error) {
+	return s.getString("subClashURI")
+}
+
+func (s *SettingService) GetSubClashEnableRouting() (bool, error) {
+	return s.getBool("subClashEnableRouting")
+}
+
+func (s *SettingService) GetSubClashRules() (string, error) {
+	return s.getString("subClashRules")
 }
 
 func (s *SettingService) GetSubJsonMux() (string, error) {
@@ -569,6 +711,14 @@ func (s *SettingService) GetSubJsonMux() (string, error) {
 
 func (s *SettingService) GetSubJsonRules() (string, error) {
 	return s.getString("subJsonRules")
+}
+
+func (s *SettingService) GetSubJsonFinalMask() (string, error) {
+	return s.getString("subJsonFinalMask")
+}
+
+func (s *SettingService) GetSubThemeDir() (string, error) {
+	return s.getString("subThemeDir")
 }
 
 func (s *SettingService) GetDatepicker() (string, error) {
@@ -581,6 +731,14 @@ func (s *SettingService) GetWarp() (string, error) {
 
 func (s *SettingService) SetWarp(data string) error {
 	return s.setString("warp", data)
+}
+
+func (s *SettingService) GetNord() (string, error) {
+	return s.getString("nord")
+}
+
+func (s *SettingService) SetNord(data string) error {
+	return s.setString("nord", data)
 }
 
 func (s *SettingService) GetExternalTrafficInformEnable() (bool, error) {
@@ -597,6 +755,14 @@ func (s *SettingService) GetExternalTrafficInformURI() (string, error) {
 
 func (s *SettingService) SetExternalTrafficInformURI(InformURI string) error {
 	return s.setString("externalTrafficInformURI", InformURI)
+}
+
+func (s *SettingService) GetRestartXrayOnClientDisable() (bool, error) {
+	return s.getBool("restartXrayOnClientDisable")
+}
+
+func (s *SettingService) SetRestartXrayOnClientDisable(value bool) error {
+	return s.setBool("restartXrayOnClientDisable", value)
 }
 
 func (s *SettingService) GetIpLimitEnable() (bool, error) {
@@ -689,6 +855,12 @@ func (s *SettingService) GetLdapDefaultLimitIP() (int, error) {
 }
 
 func (s *SettingService) UpdateAllSetting(allSetting *entity.AllSetting) error {
+	if err := s.preserveRedactedSecrets(allSetting); err != nil {
+		return err
+	}
+	if err := validateSettingsURLs(allSetting); err != nil {
+		return err
+	}
 	if err := allSetting.CheckValid(); err != nil {
 		return err
 	}
@@ -707,6 +879,58 @@ func (s *SettingService) UpdateAllSetting(allSetting *entity.AllSetting) error {
 		}
 	}
 	return common.Combine(errs...)
+}
+
+func (s *SettingService) preserveRedactedSecrets(allSetting *entity.AllSetting) error {
+	if strings.TrimSpace(allSetting.TgBotToken) == "" {
+		value, err := s.GetTgBotToken()
+		if err != nil {
+			return err
+		}
+		allSetting.TgBotToken = value
+	}
+	if strings.TrimSpace(allSetting.LdapPassword) == "" {
+		value, err := s.GetLdapPassword()
+		if err != nil {
+			return err
+		}
+		allSetting.LdapPassword = value
+	}
+	if allSetting.TwoFactorEnable && strings.TrimSpace(allSetting.TwoFactorToken) == "" {
+		value, err := s.GetTwoFactorToken()
+		if err != nil {
+			return err
+		}
+		allSetting.TwoFactorToken = value
+	}
+	return nil
+}
+
+func validateSettingsURLs(allSetting *entity.AllSetting) error {
+	if allSetting.ExternalTrafficInformURI != "" {
+		u, err := SanitizeHTTPURL(allSetting.ExternalTrafficInformURI)
+		if err != nil {
+			return common.NewError("external traffic inform URI is invalid:", err)
+		}
+		allSetting.ExternalTrafficInformURI = u
+	}
+	if allSetting.TgBotAPIServer != "" {
+		u, err := SanitizeHTTPURL(allSetting.TgBotAPIServer)
+		if err != nil {
+			return common.NewError("telegram API server URL is invalid:", err)
+		}
+		allSetting.TgBotAPIServer = u
+	}
+	return nil
+}
+
+func (s *SettingService) UpdateSecret(key string, value string) error {
+	switch key {
+	case "tgBotToken", "ldapPassword", "twoFactorToken":
+		return s.saveSetting(key, strings.TrimSpace(value))
+	default:
+		return common.NewError("secret key is not replaceable:", key)
+	}
 }
 
 func (s *SettingService) GetDefaultXrayConfig() (any, error) {
@@ -740,23 +964,50 @@ func extractHostname(host string) string {
 	return "[" + h + "]"
 }
 
+// BuildSubURIBase is shared by GetDefaultSettings (the panel's Client
+// Information page) and the subscription page so both render subscription
+// URLs identically.
+func (s *SettingService) BuildSubURIBase(host string) string {
+	subPort, _ := s.GetSubPort()
+	subDomain, _ := s.GetSubDomain()
+	subKeyFile, _ := s.GetSubKeyFile()
+	subCertFile, _ := s.GetSubCertFile()
+	subTLS := subKeyFile != "" && subCertFile != ""
+	if subDomain == "" {
+		subDomain = extractHostname(host)
+	}
+	scheme := "http"
+	if subTLS {
+		scheme = "https"
+	}
+	if (subPort == 443 && subTLS) || (subPort == 80 && !subTLS) {
+		return scheme + "://" + subDomain
+	}
+	return fmt.Sprintf("%s://%s:%d", scheme, subDomain, subPort)
+}
+
 func (s *SettingService) GetDefaultSettings(host string) (any, error) {
 	type settingFunc func() (any, error)
 	settings := map[string]settingFunc{
-		"expireDiff":    func() (any, error) { return s.GetExpireDiff() },
-		"trafficDiff":   func() (any, error) { return s.GetTrafficDiff() },
-		"pageSize":      func() (any, error) { return s.GetPageSize() },
-		"defaultCert":   func() (any, error) { return s.GetCertFile() },
-		"defaultKey":    func() (any, error) { return s.GetKeyFile() },
-		"tgBotEnable":   func() (any, error) { return s.GetTgbotEnabled() },
-		"subEnable":     func() (any, error) { return s.GetSubEnable() },
-		"subJsonEnable": func() (any, error) { return s.GetSubJsonEnable() },
-		"subTitle":      func() (any, error) { return s.GetSubTitle() },
-		"subURI":        func() (any, error) { return s.GetSubURI() },
-		"subJsonURI":    func() (any, error) { return s.GetSubJsonURI() },
-		"remarkModel":   func() (any, error) { return s.GetRemarkModel() },
-		"datepicker":    func() (any, error) { return s.GetDatepicker() },
-		"ipLimitEnable": func() (any, error) { return s.GetIpLimitEnable() },
+		"expireDiff":     func() (any, error) { return s.GetExpireDiff() },
+		"trafficDiff":    func() (any, error) { return s.GetTrafficDiff() },
+		"pageSize":       func() (any, error) { return s.GetPageSize() },
+		"defaultCert":    func() (any, error) { return s.GetCertFile() },
+		"defaultKey":     func() (any, error) { return s.GetKeyFile() },
+		"tgBotEnable":    func() (any, error) { return s.GetTgbotEnabled() },
+		"subThemeDir":    func() (any, error) { return s.GetSubThemeDir() },
+		"subEnable":      func() (any, error) { return s.GetSubEnable() },
+		"subJsonEnable":  func() (any, error) { return s.GetSubJsonEnable() },
+		"subClashEnable": func() (any, error) { return s.GetSubClashEnable() },
+		"subTitle":       func() (any, error) { return s.GetSubTitle() },
+		"subURI":         func() (any, error) { return s.GetSubURI() },
+		"subJsonURI":     func() (any, error) { return s.GetSubJsonURI() },
+		"subClashURI":    func() (any, error) { return s.GetSubClashURI() },
+		"remarkModel":    func() (any, error) { return s.GetRemarkModel() },
+		"datepicker":     func() (any, error) { return s.GetDatepicker() },
+		"ipLimitEnable":  func() (any, error) { return s.GetIpLimitEnable() },
+		"webDomain":      func() (any, error) { return s.GetWebDomain() },
+		"subDomain":      func() (any, error) { return s.GetSubDomain() },
 	}
 
 	result := make(map[string]any)
@@ -776,32 +1027,18 @@ func (s *SettingService) GetDefaultSettings(host string) (any, error) {
 			subJsonEnable = b
 		}
 	}
-	if (subEnable && result["subURI"].(string) == "") || (subJsonEnable && result["subJsonURI"].(string) == "") {
-		subURI := ""
+	subClashEnable := false
+	if v, ok := result["subClashEnable"]; ok {
+		if b, ok2 := v.(bool); ok2 {
+			subClashEnable = b
+		}
+	}
+	if (subEnable && result["subURI"].(string) == "") || (subJsonEnable && result["subJsonURI"].(string) == "") || (subClashEnable && result["subClashURI"].(string) == "") {
+		subURI := s.BuildSubURIBase(host)
 		subTitle, _ := s.GetSubTitle()
-		subPort, _ := s.GetSubPort()
 		subPath, _ := s.GetSubPath()
 		subJsonPath, _ := s.GetSubJsonPath()
-		subDomain, _ := s.GetSubDomain()
-		subKeyFile, _ := s.GetSubKeyFile()
-		subCertFile, _ := s.GetSubCertFile()
-		subTLS := false
-		if subKeyFile != "" && subCertFile != "" {
-			subTLS = true
-		}
-		if subDomain == "" {
-			subDomain = extractHostname(host)
-		}
-		if subTLS {
-			subURI = "https://"
-		} else {
-			subURI = "http://"
-		}
-		if (subPort == 443 && subTLS) || (subPort == 80 && !subTLS) {
-			subURI += subDomain
-		} else {
-			subURI += fmt.Sprintf("%s:%d", subDomain, subPort)
-		}
+		subClashPath, _ := s.GetSubClashPath()
 		if subEnable && result["subURI"].(string) == "" {
 			result["subURI"] = subURI + subPath
 		}
@@ -810,6 +1047,9 @@ func (s *SettingService) GetDefaultSettings(host string) (any, error) {
 		}
 		if subJsonEnable && result["subJsonURI"].(string) == "" {
 			result["subJsonURI"] = subURI + subJsonPath
+		}
+		if subClashEnable && result["subClashURI"].(string) == "" {
+			result["subClashURI"] = subURI + subClashPath
 		}
 	}
 
